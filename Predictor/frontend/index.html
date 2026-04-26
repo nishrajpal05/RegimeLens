@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NSE Regime Predictor</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+  <!-- Header -->
+  <header>
+    <div class="header-left">
+      <span class="logo">NSE</span>
+      <span class="logo-sub">Regime Predictor</span>
+    </div>
+    <div class="header-right">
+      <span class="status-dot" id="statusDot"></span>
+      <span class="status-label" id="statusLabel">Checking...</span>
+      <button class="btn-primary" id="trainBtn" onclick="startTraining()">Train Pipeline</button>
+    </div>
+  </header>
+
+  <!-- Main grid -->
+  <main>
+
+    <!-- Row 1: Signal card + Proxy Score + Adversarial AUC -->
+    <div class="row row-3">
+
+      <!-- Signal -->
+      <div class="card card-signal" id="signalCard">
+        <div class="card-label">Next Day Signal</div>
+        <div class="signal-direction" id="signalDirection">—</div>
+        <div class="signal-value" id="signalValue">Awaiting model</div>
+        <div class="signal-meta" id="signalMeta"></div>
+        <button class="btn-ghost" onclick="loadPredict()">Refresh</button>
+      </div>
+
+      <!-- Proxy Score -->
+      <div class="card">
+        <div class="card-label">Proxy Score</div>
+        <div class="metric-big" id="proxyScore">—</div>
+        <div class="metric-sub">2 × batch_R² − full_R²</div>
+        <div class="metric-row">
+          <span class="metric-item"><span class="dot dot-blue"></span>Full R² <strong id="fullR2">—</strong></span>
+          <span class="metric-item"><span class="dot dot-green"></span>Batch R² <strong id="batchR2">—</strong></span>
+        </div>
+        <div class="metric-note" id="leakageGap"></div>
+      </div>
+
+      <!-- Adversarial AUC -->
+      <div class="card">
+        <div class="card-label">Regime Shift (Adversarial AUC)</div>
+        <div class="metric-big" id="advAUC">—</div>
+        <div class="auc-bar-wrap">
+          <div class="auc-bar-track">
+            <div class="auc-bar-fill" id="aucBarFill"></div>
+          </div>
+          <div class="auc-bar-labels"><span>0.5</span><span>0.75</span><span>1.0</span></div>
+        </div>
+        <div class="metric-sub" id="aucInterpret"></div>
+      </div>
+
+    </div>
+
+    <!-- Row 2: Price chart -->
+    <div class="row row-1">
+      <div class="card card-chart">
+        <div class="card-label">Nifty 50 — Close Price (120 days)</div>
+        <canvas id="priceChart"></canvas>
+      </div>
+    </div>
+
+    <!-- Row 3: Blend weights + Feature stability -->
+    <div class="row row-2">
+
+      <!-- Blend weights -->
+      <div class="card">
+        <div class="card-label">Model Blend Weights</div>
+        <div id="blendList" class="blend-list"></div>
+        <div class="card-label" style="margin-top:1.5rem;">OOF R² per Model</div>
+        <canvas id="r2Chart" height="160"></canvas>
+      </div>
+
+      <!-- Feature stability -->
+      <div class="card">
+        <div class="card-label">Top Regime-Stable Features</div>
+        <div id="stabilityList" class="stability-list"></div>
+      </div>
+
+    </div>
+
+  </main>
+
+  <!-- Training overlay -->
+  <div class="overlay" id="trainingOverlay">
+    <div class="overlay-box">
+      <div class="spinner"></div>
+      <div class="overlay-title">Training Pipeline</div>
+      <div class="overlay-steps" id="overlaySteps">
+        <div class="step" id="step1">Fetching Nifty 50 data from Yahoo Finance...</div>
+        <div class="step" id="step2">Building lag &amp; session features...</div>
+        <div class="step" id="step3">Running adversarial validation...</div>
+        <div class="step" id="step4">Selecting regime-stable features...</div>
+        <div class="step" id="step5">Training 4-model LGB ensemble + Ridge meta...</div>
+        <div class="step" id="step6">Optimising proxy-score blend...</div>
+      </div>
+      <div class="overlay-note">Takes ~2–4 minutes on first run</div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
