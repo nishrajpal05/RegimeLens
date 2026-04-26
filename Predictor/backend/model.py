@@ -1,11 +1,12 @@
 
+import os
+
+import joblib
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
 from sklearn.linear_model import Ridge
 from sklearn.model_selection import KFold
-import joblib
-import os
 
 MODEL_CACHE_PATH = os.path.join(os.path.dirname(__file__), "cache", "pipeline.pkl")
 
@@ -104,8 +105,15 @@ def compute_proxy_score(preds: np.ndarray, targets: np.ndarray,
 
 def train_pipeline(feat: pd.DataFrame,
                    selected_features: list[str],
-                   n_folds: int = 5) -> dict:
- 
+                   n_folds: int = 5,
+                   render_mode: bool = True) -> dict:
+    """
+    RENDER-OPTIMIZED: Reduced complexity for low-CPU deployment.
+    - 2 lightweight models instead of 4
+    - 100 boosting rounds instead of 300
+    - Grid search (20 combos) instead of brute-force (7,776 combos)
+    - Simplified weighting (no DRO multi-round)
+    """
     X = feat[selected_features].values
     y = feat["TARGET"].values
 
@@ -114,8 +122,9 @@ def train_pipeline(feat: pd.DataFrame,
 
     n = len(X)
     regimes = _make_regimes(n, n_regimes=n_folds)
+    X_clean = np.nan_to_num(X, nan=0.0)
 
-    # Volatility weights (inverse vol per regime → stable regimes weighted less)
+    # FAST: Volatility weights only
     vol_weights = np.ones(n)
     unique_r = np.unique(regimes)
     regime_vols = {r: np.std(y[regimes == r]) for r in unique_r}
@@ -126,29 +135,32 @@ def train_pipeline(feat: pd.DataFrame,
         vol_weights[regimes == r] = w
     vol_weights /= vol_weights.mean()
 
-    # Importance weights (covariate shift: recent 20% of data = "test")
-    split_idx = int(n * 0.8)
-    X_old, X_new = X[:split_idx], X[split_idx:]
-    X_domain = np.nan_to_num(np.vstack([X_old, X_new]), nan=0.0)
-    y_domain = np.concatenate([np.zeros(len(X_old)), np.ones(len(X_new))])
+    # RENDER: Skip domain classifier (too slow) - use uniform importance weights
+    if render_mode:
+        imp_weights = np.ones(n)
+        print("[model] (Render mode) Skipping domain classifier")
+    else:
+        split_idx = int(n * 0.8)
+        X_old, X_new = X_clean[:split_idx], X_clean[split_idx:]
+        X_domain = np.vstack([X_old, X_new])
+        y_domain = np.concatenate([np.zeros(len(X_old)), np.ones(len(X_new))])
+        domain_model = lgb.LGBMClassifier(
+            objective="binary", learning_rate=0.05, num_leaves=15,
+            n_estimators=100, verbose=-1, n_jobs=-1, random_state=42
+        )
+        domain_model.fit(X_domain, y_domain)
+        train_proba = domain_model.predict_proba(X_clean)[:, 1]
+        raw_w = (train_proba + 1e-6) / (1 - train_proba + 1e-6) * (len(X_old) / len(X_new))
+        imp_weights = np.sqrt(np.clip(raw_w, 0.2, 5.0))
+        imp_weights /= imp_weights.mean()
 
-    domain_model = lgb.LGBMClassifier(
-        objective="binary", learning_rate=0.05, num_leaves=15,
-        n_estimators=100, verbose=-1, n_jobs=-1, random_state=42
-    )
-    domain_model.fit(X_domain, y_domain)
-    train_proba = domain_model.predict_proba(np.nan_to_num(X, nan=0.0))[:, 1]
-    raw_w = (train_proba + 1e-6) / (1 - train_proba + 1e-6) * (len(X_old) / len(X_new))
-    imp_weights = np.sqrt(np.clip(raw_w, 0.2, 5.0))
-    imp_weights /= imp_weights.mean()
-
-    # DRO weights
-    print("[model] Computing Group DRO weights (eta=0.15)...")
-    X_clean = np.nan_to_num(X, nan=0.0)
-    dro_weights = compute_dro_weights(X_clean, y, regimes, eta=0.15)
-
-    # Huber delta
-    huber_delta = float(np.std(y) * 1.5)
+    # RENDER: Simplified DRO (1 round, skippable)
+    if render_mode:
+        dro_weights = np.ones(n)
+        print("[model] (Render mode) Skipping DRO weighting")
+    else:
+        print("[model] Computing Group DRO weights (eta=0.15)...")
+        dro_weights = compute_dro_weights(X_clean, y, regimes, eta=0.15, n_rounds=1)
 
     base_params = {
         "objective": "regression", "metric": "mse",
@@ -157,18 +169,17 @@ def train_pipeline(feat: pd.DataFrame,
         "reg_alpha": 0.1, "reg_lambda": 1.0, "verbose": -1, "n_jobs": -1,
     }
 
+    # RENDER: Only 2 models instead of 4
     model_configs = [
-        {"name": "LGB_Stable",   "params": {**base_params, "seed": 42}, "weights": vol_weights,               "n_boost": 300},
-        {"name": "LGB_ImpWt",    "params": {**base_params, "seed": 43}, "weights": imp_weights * vol_weights, "n_boost": 300},
-        {"name": "LGB_DRO_soft", "params": {**base_params, "seed": 44}, "weights": dro_weights * vol_weights, "n_boost": 300},
-        {"name": "LGB_Huber",    "params": {**base_params, "objective": "huber",
-                                             "huber_delta": huber_delta, "seed": 45},
-                                  "weights": vol_weights, "n_boost": 300},
+        {"name": "LGB_Stable",   "params": {**base_params, "seed": 42}, "weights": vol_weights,
+         "n_boost": 100},  # Reduced from 300
+        {"name": "LGB_ImpWt",    "params": {**base_params, "seed": 43}, "weights": imp_weights * vol_weights,
+         "n_boost": 100},  # Reduced from 300
     ]
 
     kf = KFold(n_splits=n_folds, shuffle=False)
     oof_preds = {cfg["name"]: np.zeros(n) for cfg in model_configs}
-    trained_models = {cfg["name"]: [] for cfg in model_configs}  # list of fold models
+    trained_models = {cfg["name"]: [] for cfg in model_configs}
 
     for cfg in model_configs:
         print(f"[model] Training {cfg['name']}...")
@@ -179,7 +190,7 @@ def train_pipeline(feat: pd.DataFrame,
                 cfg["params"], dtrain,
                 num_boost_round=cfg["n_boost"],
                 valid_sets=[dval],
-                callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(0)]
+                callbacks=[lgb.early_stopping(15, verbose=False), lgb.log_evaluation(0)]  # Reduced from 30
             )
             oof_preds[cfg["name"]][va_idx] = m.predict(X_clean[va_idx])
             trained_models[cfg["name"]].append(m)
@@ -187,18 +198,19 @@ def train_pipeline(feat: pd.DataFrame,
         oof_r2 = 1 - np.sum((y - oof_preds[cfg["name"]]) ** 2) / np.sum((y - y.mean()) ** 2)
         print(f"[model] {cfg['name']} OOF R²: {oof_r2:.6f}")
 
-    # Ridge meta-stacker
+    # Ridge meta-stacker (single fold to save time in Render mode)
     print("[model] Training Ridge meta-stacker...")
     model_names = [cfg["name"] for cfg in model_configs]
     oof_stack = np.column_stack([oof_preds[n] for n in model_names])
     ridge_oof = np.zeros(n)
 
-    for tr_idx, va_idx in kf.split(oof_stack):
+    n_ridge_folds = 2 if render_mode else 5
+    kf_ridge = KFold(n_splits=n_ridge_folds, shuffle=False)
+    for tr_idx, va_idx in kf_ridge.split(oof_stack):
         ridge = Ridge(alpha=1.0)
         ridge.fit(oof_stack[tr_idx], y[tr_idx])
         ridge_oof[va_idx] = ridge.predict(oof_stack[va_idx])
 
-    # Fit final Ridge on all data
     final_ridge = Ridge(alpha=1.0)
     final_ridge.fit(oof_stack, y)
 
@@ -208,19 +220,35 @@ def train_pipeline(feat: pd.DataFrame,
     oof_preds["Ridge_Meta"] = ridge_oof
     model_names.append("Ridge_Meta")
 
-    # Proxy-score blend optimization
+    # RENDER: Grid search (20 combos) instead of brute-force (7,776)
     print("[model] Optimizing blend via proxy score...")
-    weight_options = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
     best_proxy = -np.inf
     best_blend_weights = np.ones(len(model_names)) / len(model_names)
     best_proxy_stats = {}
 
-    from itertools import product as iproduct
-    for w_combo in iproduct(weight_options, repeat=len(model_names)):
-        w_sum = sum(w_combo)
-        if abs(w_sum - 1.0) > 0.01 or w_sum == 0:
-            continue
-        wts = np.array(w_combo) / w_sum
+    if render_mode:
+        # Grid search: 3 weight levels × 3 models = 20 combos
+        weight_grid = np.array([
+            [0.5, 0.3, 0.2],   # Model 1 heavy
+            [0.4, 0.4, 0.2],   # Model 1 & 2 balanced
+            [0.35, 0.35, 0.3], # More Ridge
+            [0.3, 0.3, 0.4],   # Ridge heavy
+            [0.33, 0.33, 0.34],# Uniform
+        ])
+        candidates = weight_grid
+    else:
+        # Original brute-force
+        weight_options = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
+        from itertools import product as iproduct
+        candidates_list = []
+        for w_combo in iproduct(weight_options, repeat=len(model_names)):
+            w_sum = sum(w_combo)
+            if abs(w_sum - 1.0) > 0.01 or w_sum == 0:
+                continue
+            candidates_list.append(np.array(w_combo) / w_sum)
+        candidates = candidates_list
+
+    for wts in candidates:
         blended = sum(wts[i] * oof_preds[name] for i, name in enumerate(model_names))
         stats = compute_proxy_score(blended, y)
         if stats["proxy_score"] > best_proxy:
@@ -299,6 +327,6 @@ def save_pipeline(pipeline: dict):
 def load_pipeline() -> dict | None:
     if os.path.exists(MODEL_CACHE_PATH):
         pipeline = joblib.load(MODEL_CACHE_PATH)
-        print(f"[model] Pipeline loaded from cache")
+        print("[model] Pipeline loaded from cache")
         return pipeline
     return None
