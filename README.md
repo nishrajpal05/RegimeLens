@@ -2,10 +2,6 @@
 
 A real-time machine learning web app that predicts short-term market signals on Nifty 50 by adapting to changing market regimes.
 
-This project is based on my 6th place solution in the iRage Kaggle competition and extends it to work on live financial data with a deployable dashboard.
-
----
-
 ## What this project does
 
 * Fetches recent Nifty 50 market data (price + volume)
@@ -114,10 +110,7 @@ After the first run, everything loads instantly from cache.
 
 ---
 
-##  From Competition → Real World
-
-This project takes a competition-grade ML pipeline and adapts it to:
-
+## ML Pipeline
 * Work on live financial data
 * Handle changing market conditions
 * Provide real-time insights via a dashboard
