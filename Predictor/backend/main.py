@@ -1,26 +1,23 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-import numpy as np
-import pandas as pd
 import os
-import time
 import threading
+import time
 from datetime import datetime
 
 from data import fetch_nifty50_daily
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from features import (
-    build_features,
-    so3t_normalize,
-    compute_regime_stability,
     adversarial_auc,
+    build_features,
+    compute_regime_stability,
+    so3t_normalize,
 )
 from model import (
-    train_pipeline,
+    load_pipeline,
     predict,
     save_pipeline,
-    load_pipeline,
-    compute_proxy_score,
+    train_pipeline,
 )
 
 app = FastAPI(title="NSE Regime Predictor", version="1.0.0")
@@ -42,37 +39,51 @@ STATE = {
 
 
 
+TRAINING_TIMEOUT_SEC = 120  # Render timeout limit
+
+
 def run_training():
-    """Full pipeline: fetch → features → normalize → stability → train → cache."""
+    """
+    Full pipeline: fetch → features → normalize → stability → train → cache.
+    
+    RENDER OPTIMIZED:
+    - Uses render_mode=True to reduce model complexity
+    - 120-second hard timeout with fallback to cached model
+    - Lightweight feature selection if things are slow
+    """
     STATE["status"] = "training"
     STATE["error"] = None
     t0 = time.time()
 
     try:
-       
+        def elapsed():
+            return time.time() - t0
+        
         print("\n[main] Step 1: Fetching Nifty 50 data...")
         raw_df = fetch_nifty50_daily(period_days=500)
         STATE["raw_df"] = raw_df
+        print(f"[main] ✓ Fetched {len(raw_df)} rows ({elapsed():.1f}s)")
 
-      
         print("[main] Step 2: Building features...")
         feat_df = build_features(raw_df)
+        print(f"[main] ✓ Built {len(feat_df.columns)} features ({elapsed():.1f}s)")
 
-       
         print("[main] Step 3: Session normalization...")
         feat_norm, bin_stats = so3t_normalize(feat_df, session_col="day_of_week", n_bins=5)
+        print(f"[main] ✓ Normalized ({elapsed():.1f}s)")
 
-       
         print("[main] Step 4: Computing regime stability...")
         stability = compute_regime_stability(feat_norm, n_regimes=20)
         STATE["stability"] = stability
 
-     
-        n_select = max(int(len(stability) * 0.60), 10)
+        # RENDER: Select fewer features if training is slow
+        n_select = max(int(len(stability) * 0.50), 8) if elapsed() > 30 else max(int(len(stability) * 0.60), 10)
         selected_features = stability.head(n_select).index.tolist()
-        print(f"[main] Selected {len(selected_features)} regime-stable features")
+        print(f"[main] ✓ Selected {len(selected_features)} regime-stable features ({elapsed():.1f}s)")
 
-       
+        if elapsed() > TRAINING_TIMEOUT_SEC * 0.6:
+            print(f"[main] ⚠ Approaching timeout at {elapsed():.1f}s - using fast mode")
+
         print("[main] Step 5: Adversarial validation...")
         split = int(len(feat_norm) * 0.70)
         old_feat = feat_norm.iloc[:split]
@@ -80,21 +91,41 @@ def run_training():
         auc, imp = adversarial_auc(old_feat, new_feat)
         STATE["adv_auc"] = float(auc)
         STATE["adv_importances"] = imp
+        print(f"[main] ✓ Adversarial AUC={auc:.4f} ({elapsed():.1f}s)")
 
-     
-        print("[main] Step 6: Training ensemble...")
+        # RENDER: Check timeout before expensive training
+        if elapsed() > TRAINING_TIMEOUT_SEC * 0.8:
+            raise TimeoutError(f"Training exceeded {TRAINING_TIMEOUT_SEC}s threshold before ensemble - using cached model")
+
+        print("[main] Step 6: Training ensemble (RENDER MODE - optimized)...")
         STATE["feat_df"] = feat_norm
-        pipeline = train_pipeline(feat_norm, selected_features, n_folds=5)
+        pipeline = train_pipeline(feat_norm, selected_features, n_folds=5, render_mode=True)
         pipeline["bin_stats"] = bin_stats
+        
+        if elapsed() > TRAINING_TIMEOUT_SEC:
+            raise TimeoutError(f"Training exceeded {TRAINING_TIMEOUT_SEC}s - pipeline incomplete")
 
-      
         save_pipeline(pipeline)
         STATE["pipeline"] = pipeline
         STATE["last_trained"] = datetime.now().isoformat()
-        STATE["train_duration_sec"] = round(time.time() - t0, 1)
+        STATE["train_duration_sec"] = round(elapsed(), 1)
         STATE["status"] = "ready"
         print(f"\n[main] ✓ Pipeline ready in {STATE['train_duration_sec']}s")
 
+    except TimeoutError as e:
+        print(f"[main] TIMEOUT: {e}")
+        STATE["status"] = "timeout"
+        STATE["error"] = f"Training timed out: {str(e)}"
+        # Try to use cached pipeline
+        cached = load_pipeline()
+        if cached:
+            STATE["pipeline"] = cached
+            STATE["status"] = "ready_cached"
+            STATE["last_trained"] = "fallback_cached"
+            print("[main] ✓ Using cached pipeline as fallback")
+        else:
+            STATE["status"] = "error"
+            raise
     except Exception as e:
         STATE["status"] = "error"
         STATE["error"] = str(e)
