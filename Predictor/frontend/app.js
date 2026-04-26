@@ -23,10 +23,17 @@ async function checkStatus() {
     if (data.status === 'training') {
       showOverlay();
       pollTimer = setTimeout(checkStatus, 3000);
-    } else if (data.status === 'ready') {
+    } else if (data.status === 'ready' || data.status === 'ready_cached' || data.status === 'timeout') {
       hideOverlay();
       clearTimeout(pollTimer);
       loadAll();
+      
+      // Show warning if using cached/timeout mode
+      if (data.status === 'ready_cached') {
+        console.warn('⚠ Using cached model (training timed out)');
+      } else if (data.status === 'timeout') {
+        console.warn('⚠ Training timeout - model may be outdated');
+      }
     } else {
       hideOverlay();
     }
@@ -38,8 +45,25 @@ async function checkStatus() {
 function updateStatusUI(data) {
   const dot = document.getElementById('statusDot');
   const label = document.getElementById('statusLabel');
-  dot.className = 'status-dot ' + data.status;
-  label.textContent = data.status;
+  
+  // Map status to display class
+  const displayStatus = data.status === 'ready_cached' ? 'cached' : 
+                        data.status === 'timeout' ? 'warning' : 
+                        data.status;
+  
+  dot.className = 'status-dot ' + displayStatus;
+  
+  // Show user-friendly labels
+  const labels = {
+    'training': 'Training...',
+    'ready': 'Ready',
+    'ready_cached': 'Using Cache',
+    'timeout': '⚠ Timeout',
+    'idle': 'Idle',
+    'error': 'Error'
+  };
+  
+  label.textContent = labels[data.status] || data.status;
 }
 
 // ─── Training ───────────────────────────────────────────────────────────────
